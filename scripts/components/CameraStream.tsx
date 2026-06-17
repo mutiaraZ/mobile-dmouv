@@ -37,7 +37,7 @@ function WebCameraStream() {
 
   const initSocket = () => {
     // @ts-ignore
-    const socket = window.io("http://127.0.0.1:8001", {
+    const socket = window.io("http://192.168.246.17:8001", {
       transports: ["websocket"],
     });
     socketRef.current = socket;
