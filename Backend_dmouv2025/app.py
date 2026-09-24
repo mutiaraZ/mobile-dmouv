@@ -10,8 +10,8 @@ import uvicorn
 # ============================================
 # CONFIG
 # ============================================
-FLASK_SERVER_URL = "http://127.0.0.1:8001/verify"
-SOCKET_SERVER_URL = "http://127.0.0.1:8001"
+FLASK_SERVER_URL = "http://10.199.74.17:8001/verify"
+SOCKET_SERVER_URL = "http://10.199.74.17:8001"
 
 app = FastAPI()
 
@@ -115,7 +115,7 @@ async def websocket_verify(ws: WebSocket):
 if __name__ == "__main__":
     uvicorn.run(
         "app:app",
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=9001,
         reload=False
     )

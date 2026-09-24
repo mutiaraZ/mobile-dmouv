@@ -1,211 +1,168 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Platform, Text, View } from "react-native";
-import { updatePersonStatus } from "../api/api";
+import { Image, StyleSheet, Text, View } from "react-native";
+import { io, Socket } from "socket.io-client";
+
+// GANTI sesuai IP laptop yang menjalankan server.py (backend Flask)
+const BACKEND_URL = "http://10.199.74.17:8001";
+
+type Box = [number, number, number, number]; // x1, y1, x2, y2 (pixel di gambar asli)
+
+type CameraFramePayload = {
+  client_id: string;
+  image_b64: string;
+  pose_detected: boolean;
+  total_person: number;
+  boxes: Box[];
+  image_width: number;
+  image_height: number;
+};
 
 export default function CameraStream() {
-  if (Platform.OS === "web") {
-    return <WebCameraStream />;
-  }
+  const socketRef = useRef<Socket | null>(null);
+  const [frame, setFrame] = useState<CameraFramePayload | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
+  const [displaySize, setDisplaySize] = useState({ width: 0, height: 0 });
 
-  const { WebView } = require("react-native-webview");
-  return (
-    <WebView
-      source={{ uri: "http://127.0.0.1/stream" }}
-      javaScriptEnabled
-      domStorageEnabled
-      allowsInlineMediaPlayback
-      mediaPlaybackRequiresUserAction={false}
-      startInLoadingState={true}
-      style={{ flex: 1 }}
-      renderLoading={() => (
-        <View style={{ flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "#000" }}>
-          <Text style={{ color: "#fff" }}>Loading Camera...</Text>
-        </View>
-      )}
-    />
-  );
-}
-
-function WebCameraStream() {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const socketRef = useRef<any>(null);
-  const animFrameRef = useRef<number>(0);
-  const [status, setStatus] = useState<"NO PERSON" | "PERSON IDLE" | "MOTION DETECTED">("NO PERSON");
-  const [personCount, setPersonCount] = useState(0);
-  const detectionRef = useRef<any>(null);
-
-  const initSocket = () => {
-    // @ts-ignore
-    const socket = window.io("http://127.0.0.1:8001", {
+  useEffect(() => {
+    const socket = io(BACKEND_URL, {
       transports: ["websocket"],
+      reconnection: true,
+      reconnectionAttempts: 999,
+      reconnectionDelay: 1000,
     });
     socketRef.current = socket;
 
     socket.on("connect", () => {
-      console.log("[SocketIO] Connected!", socket.id);
+      console.log("[CameraStream] Terhubung ke backend");
+      setIsConnected(true);
     });
 
-    socket.on("detection_result", (data: any) => {
-      console.log("[Detection]", data);
-      if (data.status === "OK") {
-        detectionRef.current = data.data;
-        setPersonCount(data.total_person);
-        setStatus(data.total_person === 0 ? "NO PERSON" : "PERSON IDLE");
-        updatePersonStatus(data.total_person > 0 ? "detected" : "not-detected");
-      }
+    socket.on("disconnect", () => {
+      console.log("[CameraStream] Terputus dari backend");
+      setIsConnected(false);
     });
 
-    socket.on("connect_error", (err: any) => {
-      console.error("[SocketIO] connect error:", err);
+    socket.on("connect_error", (err) => {
+      console.error("[CameraStream] Connect error:", err.message);
+      setIsConnected(false);
     });
-  };
 
-  useEffect(() => {
-    if ((window as any).io) {
-      initSocket();
-      return;
-    }
-
-    const script = document.createElement("script");
-    script.src = "https://cdn.socket.io/4.6.0/socket.io.min.js";
-    script.crossOrigin = "anonymous";
-    script.onload = () => initSocket();
-    script.onerror = () => console.error("[SocketIO] Gagal load script");
-    document.head.appendChild(script);
+    // Ini event utama: tiap Raspi kirim frame ke backend, backend broadcast ke sini
+    socket.on("camera_frame", (data: CameraFramePayload) => {
+      setFrame(data);
+    });
 
     return () => {
-      socketRef.current?.disconnect?.();
-      if (document.head.contains(script)) {
-        document.head.removeChild(script);
-      }
+      socket.disconnect();
     };
   }, []);
 
-  useEffect(() => {
-    navigator.mediaDevices
-      .getUserMedia({ video: true, audio: false })
-      .then((stream) => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
-      })
-      .catch((err) => {
-        console.error("[Camera] getUserMedia error:", err);
-      });
-
-    return () => {
-      if (videoRef.current?.srcObject) {
-        (videoRef.current.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
-      }
-      cancelAnimationFrame(animFrameRef.current);
-    };
-  }, []);
-
-  const processFrame = () => {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas || video.readyState < 2) {
-      animFrameRef.current = requestAnimationFrame(processFrame);
-      return;
-    }
-
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    const detections = detectionRef.current;
-    if (detections && detections.length > 0) {
-      const scaleX = canvas.width / 320;
-      const scaleY = canvas.height / 240;
-
-      detections.forEach((det: any) => {
-        const x1 = det.bbox[0] * scaleX;
-        const y1 = det.bbox[1] * scaleY;
-        const x2 = det.bbox[2] * scaleX;
-        const y2 = det.bbox[3] * scaleY;
-
-        // Bounding box
-        ctx.strokeStyle = "#FF0000";
-        ctx.lineWidth = 2;
-        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-
-        // Label
-        ctx.fillStyle = "#FF0000";
-        ctx.font = "bold 16px Arial";
-        ctx.fillText("Person", x1, y1 > 20 ? y1 - 5 : y1 + 15);
-      });
-    }
-
-    if (Math.random() < 0.2) {
-      const tempCanvas = document.createElement("canvas");
-      tempCanvas.width = 320;
-      tempCanvas.height = 240;
-      const tempCtx = tempCanvas.getContext("2d");
-      tempCtx?.drawImage(video, 0, 0, 320, 240);
-      const b64 = tempCanvas.toDataURL("image/jpeg", 0.5).split(",")[1];
-      if (socketRef.current?.connected) {
-        socketRef.current.emit("frame", { image_b64: b64 });
-      } else {
-        console.warn("[Frame] Socket not connected yet");
-      }
-    }
-
-    animFrameRef.current = requestAnimationFrame(processFrame);
+  const handleLayout = (e: any) => {
+    const { width, height } = e.nativeEvent.layout;
+    setDisplaySize({ width, height });
   };
 
-  const handleVideoPlay = () => {
-    animFrameRef.current = requestAnimationFrame(processFrame);
-  };
+  if (!frame) {
+    return (
+      <View style={styles.container} onLayout={handleLayout}>
+        <Text style={styles.statusText}>
+          {isConnected ? "Menunggu frame dari kamera..." : "Menghubungkan ke backend..."}
+        </Text>
+      </View>
+    );
+  }
 
-  const statusColor =
-    status === "MOTION DETECTED" ? "#FF0000" :
-    status === "PERSON IDLE" ? "#FFFF00" : "#00FF00";
+  // Skala bounding box dari ukuran gambar asli ke ukuran tampilan di layar
+  const scaleX = displaySize.width / (frame.image_width || 1);
+  const scaleY = displaySize.height / (frame.image_height || 1);
 
   return (
-    <div style={{ position: "relative", width: "100%", height: "100%", backgroundColor: "#000" }}>
-      <video
-        ref={videoRef}
-        autoPlay
-        playsInline
-        muted
-        onPlay={handleVideoPlay}
-        style={{ display: "none" }}
-      />
-      <canvas
-        ref={canvasRef}
-        style={{ width: "100%", height: "100%", objectFit: "cover" }}
+    <View style={styles.container} onLayout={handleLayout}>
+      <Image
+        source={{ uri: `data:image/jpeg;base64,${frame.image_b64}` }}
+        style={StyleSheet.absoluteFill}
+        resizeMode="cover"
       />
 
-      <div style={{
-        position: "absolute",
-        top: 12,
-        left: 12,
-        backgroundColor: "rgba(0,0,0,0.6)",
-        borderRadius: 8,
-        padding: "4px 10px",
-      }}>
-        <span style={{ color: statusColor, fontWeight: "bold", fontSize: 14 }}>
-          ● {status}
-        </span>
-      </div>
+      {frame.boxes.map((box, index) => {
+        const [x1, y1, x2, y2] = box;
+        return (
+          <View
+            key={index}
+            style={[
+              styles.boundingBox,
+              {
+                left: x1 * scaleX,
+                top: y1 * scaleY,
+                width: (x2 - x1) * scaleX,
+                height: (y2 - y1) * scaleY,
+              },
+            ]}
+          >
+            <Text style={styles.boxLabel}>Person</Text>
+          </View>
+        );
+      })}
 
-      <div style={{
-        position: "absolute",
-        top: 12,
-        right: 12,
-        backgroundColor: "rgba(0,0,0,0.6)",
-        borderRadius: 8,
-        padding: "4px 10px",
-      }}>
-        <span style={{ color: "#fff", fontSize: 14 }}>
-          👤 {personCount} person
-        </span>
-      </div>
-    </div>
+      <View style={styles.statusBadge}>
+        <Text style={[styles.statusText, { color: frame.pose_detected ? "#FF0000" : "#00FF00" }]}>
+          ● {frame.pose_detected ? "MOTION DETECTED" : "NO PERSON"}
+        </Text>
+      </View>
+
+      <View style={styles.countBadge}>
+        <Text style={styles.countText}>{frame.total_person} person</Text>
+      </View>
+    </View>
   );
 }
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: "#000",
+    justifyContent: "center",
+    alignItems: "center",
+    overflow: "hidden",
+  },
+  boundingBox: {
+    position: "absolute",
+    borderWidth: 2,
+    borderColor: "#FF0000",
+  },
+  boxLabel: {
+    position: "absolute",
+    top: -20,
+    left: 0,
+    color: "#FF0000",
+    fontWeight: "bold",
+    fontSize: 12,
+  },
+  statusBadge: {
+    position: "absolute",
+    top: 12,
+    left: 12,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  countBadge: {
+    position: "absolute",
+    top: 12,
+    right: 12,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  countText: {
+    color: "#fff",
+    fontSize: 14,
+  },
+  statusText: {
+    color: "#fff",
+    fontWeight: "bold",
+    fontSize: 14,
+  },
+});

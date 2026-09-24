@@ -1,6 +1,9 @@
 import eventlet
 eventlet.monkey_patch()
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import base64
 import json
 import time
@@ -25,9 +28,19 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 # ======================================================
 # SUPABASE
 # ======================================================
+import os
+
+# PENTING: project ini HARUS sama dengan yang dipakai mobile app (lib/supabase.ts),
+# yaitu project "sfcpobdfasoyxpgxexst". Isi lewat environment variable, jangan hardcode.
+# Ambil dari Supabase dashboard -> Settings -> API (gunakan service_role key di backend saja,
+# JANGAN taruh service_role key ini di kode mobile app).
 SUPABASE_URL = "https://vljznwlefqeiymtqmnlt.supabase.co"
 SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZsanpud2xlZnFlaXltdHFtbmx0Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTc4OTg5OCwiZXhwIjoyMDk1MzY1ODk4fQ.XfALDGDlrVLXFTuo7X_65OMHQ80bmr7iBFWWDCqD74A"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZsanpud2xlZnFlaXltdHFtbmx0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3ODk4OTgsImV4cCI6MjA5NTM2NTg5OH0.KFk_DXKTC7t5L06wY_BgS8zziXi-OD42cCg4Mb3VJVU"
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://vljznwlefqeiymtqmnlt.supabase.co")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", SUPABASE_SERVICE_KEY)
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", SUPABASE_ANON_KEY)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 supabase_auth: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
@@ -36,10 +49,64 @@ supabase_auth: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 # LOAD YOLO11N-POSE (NCNN)
 # ======================================================
 net = ncnn.Net()
-net.load_param(r"C:\\Users\\mutia\\Downloads\\ML CPS\\mobile-dmouv2025\\Backend\\model.ncnn.param")
-net.load_model(r"C:\Users\mutia\Downloads\ML CPS\mobile-dmouv2025\Backend\model.ncnn.bin")
+net.load_param(r"model.ncnn.param")
+net.load_model(r"model.ncnn.bin")
 
 previous_keypoints_map = {}
+previous_device_state = {}   # client_id -> "ON" / "OFF", dipakai untuk deteksi perubahan status
+
+
+# ======================================================
+# SIMPAN EVENT KE SUPABASE (hanya saat status berubah)
+# ======================================================
+def save_detection_event(client_id, total_person, device_command):
+    """
+    Insert baris history ke Supabase HANYA ketika status ON/OFF berubah
+    dari sebelumnya, supaya tabel tidak dibanjiri baris yang sama tiap frame.
+    """
+    prev_state = previous_device_state.get(client_id)
+    previous_device_state[client_id] = device_command
+
+    if prev_state == device_command:
+        return  # tidak ada perubahan, tidak perlu insert
+
+    events = []
+
+    if device_command == "ON":
+        events.append({
+            "event_type": "motion",
+            "message": "Motion detected around the device",
+        })
+        events.append({
+            "event_type": "lamp-on",
+            "message": "Lights are now ON",
+        })
+        events.append({
+            "event_type": "fan-on",
+            "message": "Fan has been activated",
+        })
+    else:
+        events.append({
+            "event_type": "lamp-off",
+            "message": "Lights are now OFF",
+        })
+        events.append({
+            "event_type": "fan-off",
+            "message": "Fan has been turned off",
+        })
+
+    for ev in events:
+        try:
+            supabase.table("detection_history").insert({
+                "event_type": ev["event_type"],
+                "message": ev["message"],
+                "client_id": client_id,
+                "total_person": total_person,
+            }).execute()
+        except Exception as e:
+            print(f"[SUPABASE] Gagal simpan history ({ev['event_type']}): {e}")
+
+    print(f"[SUPABASE] {len(events)} event tersimpan (status: {prev_state} -> {device_command})")
 
 # ======================================================
 # MQTT CONFIG
@@ -229,11 +296,18 @@ def detect_person_pose(image_b64, client_id="http_client"):
     except Exception as e:
         print(f"[MQTT] Publish error: {e}")
 
+    # ======================================================
+    # SIMPAN KE SUPABASE (history) - hanya saat status berubah
+    # ======================================================
+    save_detection_event(client_id, len(result_list), device_command)
+
     return {
         "status":       "OK",
         "pose_detected": pose_detected,
         "total_person": len(result_list),
-        "data":         result_list
+        "data":         result_list,
+        "image_width":  original_w,
+        "image_height": original_h,
     }
 
 # ======================================================
@@ -327,6 +401,23 @@ def verify():
         client_id = data.get("client_id", "http_client")
 
         result = detect_person_pose(image_b64, client_id)
+
+        # ======================================================
+        # BROADCAST FRAME + HASIL DETEKSI KE MOBILE APP (live feed)
+        # ======================================================
+        try:
+            socketio.emit("camera_frame", {
+                "client_id": client_id,
+                "image_b64": image_b64,
+                "pose_detected": result.get("pose_detected", False),
+                "total_person": result.get("total_person", 0),
+                "boxes": [d["bbox"] for d in result.get("data", [])],
+                "image_width": result.get("image_width"),
+                "image_height": result.get("image_height"),
+            })
+        except Exception as e:
+            print(f"[SOCKET] Gagal broadcast camera_frame: {e}")
+
         return jsonify(result)
 
     except Exception as e:
@@ -428,7 +519,7 @@ def on_broadcast(data):
 if __name__ == "__main__":
     socketio.run(
         app,
-        host="127.0.0.1",
+        host="10.199.74.17",
         port=8001,
         debug=False
     )

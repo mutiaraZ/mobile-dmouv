@@ -16,7 +16,7 @@ export type User = {
 // ===============================
 export const login = async (email: string, password: string): Promise<User | null> => {
   try {
-    const res = await fetch("http://127.0.0.1:8001/api/auth/login", {
+    const res = await fetch("http://10.199.74.17:8001/api/auth/login", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
