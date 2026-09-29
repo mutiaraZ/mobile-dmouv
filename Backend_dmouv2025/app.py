@@ -10,8 +10,8 @@ import uvicorn
 # ============================================
 # CONFIG
 # ============================================
-FLASK_SERVER_URL = "http://10.199.74.17:8001/verify"
-SOCKET_SERVER_URL = "http://10.199.74.17:8001"
+FLASK_SERVER_URL = "http://127.0.0.1:8001/verify"
+SOCKET_SERVER_URL = "http://127.0.0.1:8001"
 
 app = FastAPI()
 

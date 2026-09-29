@@ -511,7 +511,7 @@ if __name__ == "__main__":
 
     socketio.run(
         app,
-        host="10.199.74.17",
+        host="0.0.0.0",
         port=8001,
         debug=False
     )
