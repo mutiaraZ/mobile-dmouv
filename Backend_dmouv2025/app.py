@@ -1,4 +1,5 @@
 import base64
+from concurrent.futures import process
 import json
 import cv2
 import socketio
@@ -10,8 +11,8 @@ import uvicorn
 # ============================================
 # CONFIG
 # ============================================
-FLASK_SERVER_URL = "http://127.0.0.1:8001/verify"
-SOCKET_SERVER_URL = "http://127.0.0.1:8001"
+FLASK_SERVER_URL = process.env.BACKEND_HOST + ":" + process.env.BACKEND_PORT + "/verify"
+SOCKET_SERVER_URL = process.env.BACKEND_HOST + ":" + process.env.BACKEND_PORT
 
 app = FastAPI()
 

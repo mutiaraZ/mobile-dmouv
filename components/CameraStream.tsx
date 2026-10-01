@@ -3,7 +3,7 @@ import { Image, StyleSheet, Text, View } from "react-native";
 import { io, Socket } from "socket.io-client";
 
 // GANTI sesuai IP laptop yang menjalankan server.py (backend Flask)
-const BACKEND_URL = "http://127.0.0.1:8001";
+const BACKEND_URL = `http://${process.env.BACKEND_HOST}:${process.env.BACKEND_PORT}`;
 
 type Box = [number, number, number, number]; // x1, y1, x2, y2 (pixel di gambar asli)
 

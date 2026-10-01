@@ -1,4 +1,5 @@
-```python
+from multiprocessing import process
+
 import eventlet
 eventlet.monkey_patch()
 
@@ -34,11 +35,9 @@ socketio = SocketIO(
 # SUPABASE
 # ======================================================
 
-SUPABASE_URL = "https://vljznwlefqeiymtqmnlt.supabase.co"
-
-# GANTI dengan key milik kamu
-SUPABASE_SERVICE_KEY = "YOUR_SUPABASE_SERVICE_KEY"
-SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY"
+SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL
+SUPABASE_SERVICE_KEY = process.env.EXPO_PUBLIC_SUPABASE_SERVICE_ROLE_KEY
+SUPABASE_ANON_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY
 
 supabase: Client = create_client(
     SUPABASE_URL,

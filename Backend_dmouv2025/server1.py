@@ -1,3 +1,5 @@
+from concurrent.futures import process
+
 import eventlet
 eventlet.monkey_patch()
 
@@ -44,11 +46,11 @@ previous_keypoints_map = {}
 # ======================================================
 # MQTT CONFIG
 # ======================================================
-MQTT_BROKER     = "n1a44690.ala.asia-southeast1.emqxsl.com"
-MQTT_PORT       = 8883                # SSL/TLS port
-MQTT_USERNAME   = "testuser"
-MQTT_PASSWORD   = "testpass123"
-DEVICE_ID       = "dmouv"
+MQTT_BROKER     = process.env.MQTT_BROKER
+MQTT_PORT       = int(process.env.MQTT_PORT) if process.env.MQTT_PORT else 8883
+MQTT_USERNAME   = process.env.MQTT_USERNAME
+MQTT_PASSWORD   = process.env.MQTT_PASSWORD
+DEVICE_ID       = process.env.DEVICE_ID
 
 # Topics
 MQTT_TOPIC_DETECTION = f"{DEVICE_ID}/detection/status"   # publish hasil deteksi pose
