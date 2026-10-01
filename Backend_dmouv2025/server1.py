@@ -25,9 +25,9 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 # ======================================================
 # SUPABASE
 # ======================================================
-SUPABASE_URL = "https://vljznwlefqeiymtqmnlt.supabase.co"
-SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZsanpud2xlZnFlaXltdHFtbmx0Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTc4OTg5OCwiZXhwIjoyMDk1MzY1ODk4fQ.XfALDGDlrVLXFTuo7X_65OMHQ80bmr7iBFWWDCqD74A"
-SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZsanpud2xlZnFlaXltdHFtbmx0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3ODk4OTgsImV4cCI6MjA5NTM2NTg5OH0.KFk_DXKTC7t5L06wY_BgS8zziXi-OD42cCg4Mb3VJVU"
+SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL
+SUPABASE_SERVICE_KEY = process.env.EXPO_PUBLIC_SUPABASE_SERVICE_ROLE_KEY
+SUPABASE_ANON_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 supabase_auth: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
