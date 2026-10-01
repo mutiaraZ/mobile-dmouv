@@ -1,0 +1,10 @@
+flask
+flask-cors
+flask-socketio
+eventlet
+python-dotenv
+paho-mqtt<2
+supabase
+numpy
+opencv-python-headless
+ncnn

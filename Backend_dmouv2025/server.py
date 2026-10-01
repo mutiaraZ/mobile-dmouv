@@ -1,1253 +1,456 @@
-from multiprocessing import process
 
 import eventlet
 eventlet.monkey_patch()
 
 import base64
+import hmac
 import json
+import os
 import time
-import cv2
-import numpy as np
-import ncnn
-import paho.mqtt.client as mqtt
+from functools import wraps
 
-from flask import Flask, request, jsonify
+import cv2
+import paho.mqtt.client as mqtt
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from supabase import create_client, Client
 from flask_socketio import SocketIO, emit
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+from model import CommandGenerator, PoseModel, decode_base64_image  # noqa: E402
 
 # ======================================================
-# INITIALIZE APP
+# CONFIG (semua dari .env)
 # ======================================================
+PORT = int(os.getenv("PORT", "8001"))
+WS_AUTH_TOKEN = os.getenv("WS_AUTH_TOKEN", "")  # kosong = tanpa auth
 
+CAMERA_AUTOSTART = os.getenv("CAMERA_AUTOSTART", "1") == "1"
+CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
+CAPTURE_INTERVAL = float(os.getenv("CAPTURE_INTERVAL", "0.2"))
+STATUS_INTERVAL = float(os.getenv("STATUS_INTERVAL", "5"))
+
+MQTT_BROKER = os.getenv("MQTT_BROKER", "")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+DEVICE_ID = os.getenv("DEVICE_ID", "dmouv")
+
+TOPIC_DETECTION = f"{DEVICE_ID}/detection/status"
+TOPIC_SERVER_COMMAND = f"{DEVICE_ID}/server/command"
+DEVICE_TOPICS = {
+    "lamp": os.getenv("MQTT_TOPIC_LAMP", f"{DEVICE_ID}/device/lamp"),
+    "fan": os.getenv("MQTT_TOPIC_FAN", f"{DEVICE_ID}/device/fan"),
+}
+
+# ======================================================
+# APP
+# ======================================================
 app = Flask(__name__)
 CORS(app)
-
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="eventlet"
+    async_mode="eventlet",
+    max_http_buffer_size=5 * 1024 * 1024,  # default 1 MB; frame base64 dari HP bisa lebih
 )
 
-
-# ======================================================
-# SUPABASE
-# ======================================================
-
-SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL
-SUPABASE_SERVICE_KEY = process.env.EXPO_PUBLIC_SUPABASE_SERVICE_ROLE_KEY
-SUPABASE_ANON_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY
-
-supabase: Client = create_client(
-    SUPABASE_URL,
-    SUPABASE_SERVICE_KEY
+pose_model = PoseModel()
+generator = CommandGenerator(
+    devices=tuple(DEVICE_TOPICS),
+    on_confirm_frames=int(os.getenv("ON_CONFIRM_FRAMES", "3")),
+    off_delay_sec=float(os.getenv("OFF_DELAY_SEC", "10")),
 )
 
-supabase_auth: Client = create_client(
-    SUPABASE_URL,
-    SUPABASE_ANON_KEY
-)
+# ======================================================
+# SUPABASE (hanya untuk /api/auth/login) - key dibaca dari .env milik backend
+# ======================================================
+supabase = supabase_auth = None
+_sb_url = os.getenv("SUPABASE_URL")
+_sb_service = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+_sb_anon = os.getenv("SUPABASE_ANON_KEY")
+if _sb_url and _sb_service and _sb_anon:
+    from supabase import create_client
+    supabase = create_client(_sb_url, _sb_service)
+    supabase_auth = create_client(_sb_url, _sb_anon)
+else:
+    print("[SUPABASE] env belum lengkap - /api/auth/login dinonaktifkan")
 
 
 # ======================================================
-# LOAD YOLO11N-POSE (NCNN)
+# AUTH TOKEN (opsional)
 # ======================================================
-
-net = ncnn.Net()
-
-net.load_param(r"model.ncnn.param")
-net.load_model(r"model.ncnn.bin")
-
-previous_keypoints_map = {}
+def token_ok(candidate):
+    return not WS_AUTH_TOKEN or hmac.compare_digest(str(candidate or ""), WS_AUTH_TOKEN)
 
 
-# ======================================================
-# MQTT CONFIG
-# ======================================================
-
-MQTT_BROKER = "n1a44690.ala.asia-southeast1.emqxsl.com"
-MQTT_PORT = 8883
-
-MQTT_USERNAME = "testuser"
-MQTT_PASSWORD = "testpass123"
-
-DEVICE_ID = "dmouv"
-
-MQTT_TOPIC_DETECTION = f"{DEVICE_ID}/detection/status"
-MQTT_TOPIC_DEVICE = f"{DEVICE_ID}/device/control"
-MQTT_TOPIC_COMMAND = f"{DEVICE_ID}/server/command"
-
-
-mqtt_client = mqtt.Client(
-    client_id="dmouv-server",
-    protocol=mqtt.MQTTv311
-)
+def require_token(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not token_ok(request.headers.get("X-Auth-Token")):
+            return jsonify({"success": False, "message": "Unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
 
 
 # ======================================================
-# MQTT CALLBACKS
+# MQTT
 # ======================================================
+mqtt_client = None
+
+
+def mqtt_publish(topic, payload):
+    if mqtt_client is None:
+        print(f"[MQTT off] {topic}: {payload}")
+        return
+    mqtt_client.publish(topic, payload, qos=1)
+
 
 def on_mqtt_connect(client, userdata, flags, rc):
-
     if rc == 0:
-
-        print("[MQTT] Connected to broker")
-
-        client.subscribe(MQTT_TOPIC_COMMAND)
-
-        print(
-            f"[MQTT] Subscribed to: "
-            f"{MQTT_TOPIC_COMMAND}"
-        )
-
+        print("[MQTT] Connected")
+        client.subscribe(TOPIC_SERVER_COMMAND)
     else:
-
-        print(
-            f"[MQTT] Failed to connect, rc={rc}"
-        )
-
-
-def on_mqtt_disconnect(client, userdata, rc):
-
-    print(
-        f"[MQTT] Disconnected, rc={rc}"
-    )
+        print(f"[MQTT] Gagal connect, rc={rc}")
 
 
 def on_mqtt_message(client, userdata, msg):
-
-    topic = msg.topic
-
-    payload = msg.payload.decode()
-
-    print(
-        f"[MQTT] Received | "
-        f"{topic}: {payload}"
-    )
-
     try:
-
-        data = json.loads(payload)
-
-        command = data.get("command")
-
+        command = json.loads(msg.payload.decode()).get("command")
         if command == "reset":
-
-            print(
-                "[MQTT] Reset command received"
-            )
-
+            generator.set_mode("all", "auto")
+            socketio.emit("device_state", generator.snapshot())
         elif command == "status":
-
-            mqtt_client.publish(
-                MQTT_TOPIC_DETECTION,
-                json.dumps({
-                    "server": "online",
-                    "timestamp": time.time()
-                })
-            )
-
+            publish_status()
     except Exception as e:
-
-        print(
-            f"[MQTT] Message parse error: {e}"
-        )
+        print(f"[MQTT] Pesan tidak valid: {e}")
 
 
-# ======================================================
-# MQTT SETUP
-# ======================================================
+def setup_mqtt():
+    global mqtt_client
+    if not MQTT_BROKER:
+        print("[MQTT] MQTT_BROKER kosong - publish dinonaktifkan")
+        return
+    client = mqtt.Client(client_id=f"{DEVICE_ID}-server", protocol=mqtt.MQTTv311)
+    if MQTT_USERNAME:
+        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+    if MQTT_PORT == 8883:
+        client.tls_set()
+    client.on_connect = on_mqtt_connect
+    client.on_message = on_mqtt_message
+    client.reconnect_delay_set(1, 30)
+    # connect_async + loop_start: tetap mencoba tersambung kalau WiFi Raspi belum siap saat boot
+    client.connect_async(MQTT_BROKER, MQTT_PORT, keepalive=60)
+    client.loop_start()
+    mqtt_client = client
 
-mqtt_client.username_pw_set(
-    MQTT_USERNAME,
-    MQTT_PASSWORD
-)
 
-mqtt_client.tls_set(
-    tls_version=mqtt.ssl.PROTOCOL_TLS
-)
-
-mqtt_client.on_connect = on_mqtt_connect
-mqtt_client.on_disconnect = on_mqtt_disconnect
-mqtt_client.on_message = on_mqtt_message
-
-
-try:
-
-    mqtt_client.connect(
-        MQTT_BROKER,
-        MQTT_PORT,
-        keepalive=60
-    )
-
-    mqtt_client.loop_start()
-
-    print(
-        f"[MQTT] Connecting to "
-        f"{MQTT_BROKER}:{MQTT_PORT} (TLS)..."
-    )
-
-except Exception as e:
-
-    print(
-        f"[MQTT] Could not connect to broker: {e}"
-    )
+def publish_status():
+    mqtt_publish(TOPIC_DETECTION, json.dumps({
+        "server": "online",
+        "state": generator.snapshot(),
+        "timestamp": time.time(),
+    }))
 
 
 # ======================================================
-# DECODE BASE64 IMAGE
+# PIPELINE: frame -> deteksi -> perintah
 # ======================================================
-
-def decode_base64_image(image_b64: str):
-
-    if not image_b64:
-
-        raise ValueError(
-            "image_b64 is empty"
-        )
-
-    image_bytes = base64.b64decode(
-        image_b64
-    )
-
-    np_arr = np.frombuffer(
-        image_bytes,
-        dtype=np.uint8
-    )
-
-    img = cv2.imdecode(
-        np_arr,
-        cv2.IMREAD_COLOR
-    )
-
-    if img is None:
-
-        raise ValueError(
-            "Failed to decode image"
-        )
-
-    return img
-
-
-# ======================================================
-# YOLO PERSON POSE DETECTION
-# ======================================================
-
-CONF_THRESHOLD = 0.5
-NMS_THRESHOLD = 0.45
-INPUT_SIZE = 640
-
-
-def detect_person_pose_from_frame(
-    img,
-    client_id="camera_local"
-):
-
-    original_h, original_w = img.shape[:2]
-
-    resized = cv2.resize(
-        img,
-        (INPUT_SIZE, INPUT_SIZE)
-    )
-
-    mat_in = ncnn.Mat.from_pixels(
-        resized,
-        ncnn.Mat.PixelType.PIXEL_BGR,
-        INPUT_SIZE,
-        INPUT_SIZE
-    )
-
-    norm_vals = [
-        1 / 255.0,
-        1 / 255.0,
-        1 / 255.0
-    ]
-
-    mat_in.substract_mean_normalize(
-        [],
-        norm_vals
-    )
-
-    with net.create_extractor() as ex:
-
-        ex.input(
-            "in0",
-            mat_in
-        )
-
-        ret, out0 = ex.extract(
-            "out0"
-        )
-
-    if ret != 0:
-
-        return {
-            "status": "ERROR",
-            "message":
-                "YOLO pose extraction failed"
-        }
-
-    output = np.array(out0).T
-
-    boxes = []
-    confidences = []
-    all_keypoints = []
-
-
-    for det in output:
-
-        x, y, bw, bh = det[0:4]
-
-        conf = det[4]
-
-        if conf < CONF_THRESHOLD:
-
-            continue
-
-
-        x1 = int(
-            (x - bw / 2)
-            * original_w
-            / INPUT_SIZE
-        )
-
-        y1 = int(
-            (y - bh / 2)
-            * original_h
-            / INPUT_SIZE
-        )
-
-        w_box = int(
-            bw
-            * original_w
-            / INPUT_SIZE
-        )
-
-        h_box = int(
-            bh
-            * original_h
-            / INPUT_SIZE
-        )
-
-
-        kp_raw = det[5:]
-
-        keypoints = []
-
-
-        for i in range(
-            0,
-            len(kp_raw),
-            3
-        ):
-
-            kx = int(
-                kp_raw[i]
-                * original_w
-                / INPUT_SIZE
-            )
-
-            ky = int(
-                kp_raw[i + 1]
-                * original_h
-                / INPUT_SIZE
-            )
-
-            ks = float(
-                kp_raw[i + 2]
-            )
-
-            keypoints.append(
-                [kx, ky, ks]
-            )
-
-
-        boxes.append([
-            x1,
-            y1,
-            w_box,
-            h_box
-        ])
-
-        confidences.append(
-            float(conf)
-        )
-
-        all_keypoints.append(
-            keypoints
-        )
-
-
-    indices = cv2.dnn.NMSBoxes(
-        boxes,
-        confidences,
-        CONF_THRESHOLD,
-        NMS_THRESHOLD
-    )
-
-    result_list = []
-
-
-    if len(indices) > 0:
-
-        for idx in indices.flatten():
-
-            x1, y1, w_box, h_box = \
-                boxes[idx]
-
-            x2 = x1 + w_box
-            y2 = y1 + h_box
-
-            result_list.append({
-
-                "bbox": [
-                    float(x1),
-                    float(y1),
-                    float(x2),
-                    float(y2)
-                ],
-
-                "conf":
-                    confidences[idx],
-
-                "keypoints":
-                    all_keypoints[idx]
-            })
-
-
-    previous_keypoints_map[
-        client_id
-    ] = result_list
-
-    pose_detected = (
-        len(result_list) > 0
-    )
-
-
-    # ==================================================
-    # MQTT
-    # ==================================================
-
+_last_status = {"person": None, "at": 0.0}
+
+
+def publish_commands(commands):
+    for cmd in commands:
+        mqtt_publish(DEVICE_TOPICS[cmd["device"]], cmd["command"])
+        print(f"[CMD] {cmd['device']} -> {cmd['command']} ({cmd['reason']})")
+        socketio.emit("device_command", cmd)
+    if commands:
+        socketio.emit("device_state", generator.snapshot())
+
+
+def publish_detection_status(result, client_id):
+    """Status deteksi ke MQTT hanya saat berubah / tiap STATUS_INTERVAL, bukan tiap frame."""
+    if result.get("status") != "OK":
+        return
+    now = time.time()
+    person = result["pose_detected"]
+    if person != _last_status["person"] or now - _last_status["at"] >= STATUS_INTERVAL:
+        _last_status.update(person=person, at=now)
+        mqtt_publish(TOPIC_DETECTION, json.dumps({
+            "client_id": client_id,
+            "pose_detected": person,
+            "total_person": result["total_person"],
+            "timestamp": now,
+        }))
+
+
+def process_frame(img, client_id):
+    result = pose_model.detect(img)
+    commands = generator.update(result)
+    publish_commands(commands)
     try:
-
-        detection_payload = json.dumps({
-
-            "client_id":
-                client_id,
-
-            "pose_detected":
-                pose_detected,
-
-            "total_person":
-                len(result_list),
-
-            "timestamp":
-                time.time()
-        })
-
-
-        mqtt_client.publish(
-            MQTT_TOPIC_DETECTION,
-            detection_payload
-        )
-
-
-        device_command = (
-            "ON"
-            if pose_detected
-            else "OFF"
-        )
-
-
-        mqtt_client.publish(
-            MQTT_TOPIC_DEVICE,
-            device_command
-        )
-
-
-        print(
-            f"[MQTT] Published → "
-            f"{MQTT_TOPIC_DEVICE}: "
-            f"{device_command} | "
-            f"persons: "
-            f"{len(result_list)}"
-        )
-
-
-    except Exception as e:
-
-        print(
-            f"[MQTT] Publish error: {e}"
-        )
-
-
-    return {
-
-        "status": "OK",
-
-        "pose_detected":
-            pose_detected,
-
-        "total_person":
-            len(result_list),
-
-        "data":
-            result_list
-    }
+        publish_detection_status(result, client_id)
+    except Exception as e:  # status MQTT gagal tidak boleh menggagalkan hasil deteksi
+        print(f"[MQTT] Gagal publish status: {e}")
+    return result, commands
 
 
 # ======================================================
-# BASE64 DETECTION WRAPPER
+# KAMERA LOKAL RASPI (USB webcam)
 # ======================================================
-
-def detect_person_pose(
-    image_b64,
-    client_id="http_client"
-):
-
-    img = decode_base64_image(
-        image_b64
-    )
-
-    return detect_person_pose_from_frame(
-        img,
-        client_id
-    )
-
-
-# ======================================================
-# WEBCAM CONFIG
-# ======================================================
-
-CAMERA_INDEX = 0
-
-CAPTURE_INTERVAL = 0.2
-
 camera_running = False
 
 
-# ======================================================
-# WEBCAM LOOP
-# ======================================================
-
 def webcam_loop():
-
     global camera_running
-
-
-    cap = cv2.VideoCapture(
-        CAMERA_INDEX
-    )
-
-
-    # Optional: set resolution
-    cap.set(
-        cv2.CAP_PROP_FRAME_WIDTH,
-        640
-    )
-
-    cap.set(
-        cv2.CAP_PROP_FRAME_HEIGHT,
-        480
-    )
-
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     if not cap.isOpened():
-
-        print(
-            f"[CAMERA] Gagal membuka "
-            f"webcam index "
-            f"{CAMERA_INDEX}"
-        )
-
+        print(f"[CAMERA] Gagal membuka kamera index {CAMERA_INDEX}")
         camera_running = False
-
         return
 
-
     camera_running = True
-
-    print(
-        "[CAMERA] Webcam loop dimulai"
-    )
-
-
-    while camera_running:
-
-        ret, frame = cap.read()
-
-
-        if not ret:
-
-            print(
-                "[CAMERA] Gagal membaca "
-                "frame, retry..."
-            )
-
-            socketio.sleep(1)
-
-            continue
-
-
-        try:
-
-            # ==========================================
-            # YOLO DETECTION
-            # ==========================================
-
-            result = detect_person_pose_from_frame(
-                frame,
-                client_id="webcam_local"
-            )
+    print("[CAMERA] Loop dimulai")
+    try:
+        while camera_running:
+            ok, frame = cap.read()
+            if not ok:
+                socketio.sleep(1)
+                continue
+            try:
+                result, _ = process_frame(frame, "webcam_local")
+                enc_ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if enc_ok and result.get("status") == "OK":
+                    socketio.emit("camera_frame", {
+                        "client_id": "webcam_local",
+                        "image_b64": base64.b64encode(buf.tobytes()).decode(),
+                        "pose_detected": result["pose_detected"],
+                        "total_person": result["total_person"],
+                        "boxes": result["boxes"],
+                        "image_width": result["image_width"],
+                        "image_height": result["image_height"],
+                    })
+                socketio.emit("detection_result", result)
+            except Exception as e:
+                print(f"[CAMERA] Error: {e}")
+            socketio.sleep(CAPTURE_INTERVAL)  # bukan time.sleep: jangan blok eventlet
+    finally:
+        cap.release()
+        camera_running = False
+        print("[CAMERA] Loop dihentikan")
 
 
-            # ==========================================
-            # ENCODE FRAME
-            # ==========================================
-
-            success, buffer = cv2.imencode(
-                ".jpg",
-                frame,
-                [
-                    cv2.IMWRITE_JPEG_QUALITY,
-                    70
-                ]
-            )
-
-
-            if success:
-
-                frame_b64 = base64.b64encode(
-                    buffer.tobytes()
-                ).decode("utf-8")
-
-
-                # ======================================
-                # KIRIM FRAME + DETECTION KE FRONTEND
-                # ======================================
-
-                socketio.emit(
-                    "camera_frame",
-                    {
-                        "image": frame_b64,
-                        "detection": result
-                    }
-                )
-
-
-            # ==========================================
-            # KIRIM HASIL DETEKSI TERPISAH
-            # ==========================================
-
-            socketio.emit(
-                "detection_result",
-                result
-            )
-
-
-        except Exception as e:
-
-            print(
-                f"[CAMERA] Detection error: {e}"
-            )
-
-
-        socketio.sleep(
-            CAPTURE_INTERVAL
-        )
-
-
-    cap.release()
-
-    print(
-        "[CAMERA] Webcam loop dihentikan"
-    )
+def start_camera():
+    global camera_running
+    if camera_running:
+        return False
+    camera_running = True
+    socketio.start_background_task(webcam_loop)
+    return True
 
 
 # ======================================================
-# ROUTES
+# HTTP ROUTES
 # ======================================================
-
 @app.route("/")
 def home():
-
-    return jsonify({
-        "message":
-            "ML Flask Server OK"
-    })
+    return jsonify({"message": "DMouv backend OK"})
 
 
 @app.route("/ping")
 def ping():
-
-    return jsonify({
-
-        "ml_server":
-            "online",
-
-        "timestamp":
-            time.time()
-    })
+    return jsonify({"server": "online", "timestamp": time.time()})
 
 
-# ======================================================
-# LOGIN
-# ======================================================
-
-@app.route(
-    "/api/auth/login",
-    methods=["POST"]
-)
+@app.route("/api/auth/login", methods=["POST"])
 def login():
-
+    if supabase is None:
+        return jsonify({"success": False, "message": "Supabase belum dikonfigurasi"}), 503
     try:
-
-        data = request.json
-
-        email = data.get(
-            "email"
-        )
-
-        password = data.get(
-            "password"
-        )
-
-
+        data = request.json or {}
+        email, password = data.get("email"), data.get("password")
         if not email or not password:
-
-            return jsonify({
-
-                "success": False,
-
-                "message":
-                    "Email dan password wajib diisi"
-
-            }), 400
-
+            return jsonify({"success": False, "message": "Email dan password wajib diisi"}), 400
 
         try:
-
-            auth = (
-                supabase_auth
-                .auth
-                .sign_in_with_password({
-
-                    "email": email,
-
-                    "password":
-                        password
-                })
-            )
-
-
-            profile = (
-                supabase
-                .table("profiles")
-                .select("role")
-                .eq(
-                    "id",
-                    auth.user.id
-                )
-                .single()
-                .execute()
-            )
-
-
-            role = (
-                profile.data.get(
-                    "role",
-                    "user"
-                )
-                if profile.data
-                else "user"
-            )
-
-
+            auth = supabase_auth.auth.sign_in_with_password({"email": email, "password": password})
+            profile = supabase.table("profiles").select("role").eq("id", auth.user.id).single().execute()
+            role = profile.data.get("role", "user") if profile.data else "user"
             return jsonify({
-
                 "success": True,
-
-                "token":
-                    auth.session.access_token,
-
-                "user": {
-
-                    "id":
-                        auth.user.id,
-
-                    "email":
-                        auth.user.email,
-
-                    "role":
-                        role
-                }
+                "token": auth.session.access_token,
+                "user": {"id": auth.user.id, "email": auth.user.email, "role": role},
             })
-
-
         except Exception as auth_error:
-
-            print(
-                "[AUTH] Primary auth failed, "
-                "trying fallback...",
-                str(auth_error)
-            )
-
-
-            result = (
-                supabase
-                .rpc(
-                    "verify_user_password",
-                    {
-                        "user_email":
-                            email,
-
-                        "user_password":
-                            password
-                    }
-                )
-                .execute()
-            )
-
-
+            print("[AUTH] Primary auth gagal, coba fallback:", auth_error)
+            result = supabase.rpc("verify_user_password", {
+                "user_email": email, "user_password": password
+            }).execute()
             if not result.data:
-
-                return jsonify({
-
-                    "success": False,
-
-                    "message":
-                        "Email atau password salah"
-
-                }), 401
-
-
+                return jsonify({"success": False, "message": "Email atau password salah"}), 401
             return jsonify({
-
                 "success": True,
-
-                "token":
-                    "manual_token_" + email,
-
+                "token": "manual_token_" + email,
                 "user": {
-
-                    "id":
-                        result.data[0]["id"],
-
-                    "email":
-                        email,
-
-                    "role":
-                        result.data[0].get(
-                            "role",
-                            "user"
-                        )
-                }
+                    "id": result.data[0]["id"],
+                    "email": email,
+                    "role": result.data[0].get("role", "user"),
+                },
             })
-
-
     except Exception as e:
-
-        print(
-            "[LOGIN ERROR]",
-            repr(e)
-        )
-
-        return jsonify({
-
-            "success": False,
-
-            "message":
-                str(e)
-
-        }), 500
+        print("[LOGIN ERROR]", repr(e))
+        return jsonify({"success": False, "message": str(e)}), 500
 
 
-# ======================================================
-# VERIFY HTTP
-# ======================================================
-
-@app.route(
-    "/verify",
-    methods=["POST"]
-)
+@app.route("/verify", methods=["POST"])
+@require_token
 def verify():
-
     try:
-
-        data = request.json
-
-        image_b64 = data.get(
-            "image_b64"
-        )
-
-        client_id = data.get(
-            "client_id",
-            "http_client"
-        )
-
-
-        result = detect_person_pose(
-            image_b64,
-            client_id
-        )
-
-
-        return jsonify(result)
-
-
+        data = request.json or {}
+        img = decode_base64_image(data.get("image_b64"))
+        result, commands = process_frame(img, data.get("client_id", "http_client"))
+        return jsonify({**result, "commands": commands})
     except Exception as e:
-
-        return jsonify({
-
-            "error":
-                str(e)
-
-        }), 500
+        return jsonify({"error": str(e)}), 500
 
 
-# ======================================================
-# MQTT DEVICE CONTROL
-# ======================================================
-
-@app.route(
-    "/api/device/control",
-    methods=["POST"]
-)
+@app.route("/api/device/control", methods=["POST"])
+@require_token
 def device_control():
-
     try:
-
-        data = request.json
-
-        device_id = data.get(
-            "device_id",
-            "all"
-        )
-
-        command = data.get(
-            "command",
-            "OFF"
-        )
-
-
-        topic = (
-            f"dmouv/device/"
-            f"{device_id}"
-        )
-
-
-        mqtt_client.publish(
-            topic,
-            command
-        )
-
-
-        print(
-            f"[MQTT] Manual control → "
-            f"{topic}: {command}"
-        )
-
-
-        return jsonify({
-
-            "success": True,
-
-            "topic":
-                topic,
-
-            "command":
-                command
-        })
-
-
+        data = request.json or {}
+        device = data.get("device") or data.get("device_id") or "all"
+        commands = generator.manual(device, data.get("command", "OFF"))
+        publish_commands(commands)
+        return jsonify({"success": True, "commands": commands})
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 400
     except Exception as e:
-
-        return jsonify({
-
-            "success": False,
-
-            "message":
-                str(e)
-
-        }), 500
+        return jsonify({"success": False, "message": str(e)}), 500
 
 
-@app.route(
-    "/api/device/status",
-    methods=["GET"]
-)
+@app.route("/api/device/mode", methods=["POST"])
+@require_token
+def device_mode():
+    try:
+        data = request.json or {}
+        generator.set_mode(data.get("device", "all"), data.get("mode"))
+        socketio.emit("device_state", generator.snapshot())
+        return jsonify({"success": True, "state": generator.snapshot()})
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 400
+
+
+@app.route("/api/device/status", methods=["GET"])
+@require_token
 def device_status():
-
-    try:
-
-        mqtt_client.publish(
-            MQTT_TOPIC_DETECTION,
-            json.dumps({
-
-                "server":
-                    "online",
-
-                "timestamp":
-                    time.time()
-            })
-        )
+    publish_status()
+    return jsonify({"success": True, "state": generator.snapshot()})
 
 
-        return jsonify({
-
-            "success": True,
-
-            "message":
-                "Status published to MQTT"
-        })
-
-
-    except Exception as e:
-
-        return jsonify({
-
-            "success": False,
-
-            "message":
-                str(e)
-
-        }), 500
-
-
-# ======================================================
-# CAMERA START
-# ======================================================
-
-@app.route(
-    "/api/camera/start",
-    methods=["POST"]
-)
+@app.route("/api/camera/start", methods=["POST"])
+@require_token
 def camera_start():
-
-    global camera_running
-
-
-    if camera_running:
-
-        return jsonify({
-
-            "success": False,
-
-            "message":
-                "Kamera sudah berjalan"
-        })
+    started = start_camera()
+    return jsonify({"success": started,
+                    "message": "Kamera dimulai" if started else "Kamera sudah berjalan"})
 
 
-    socketio.start_background_task(
-        webcam_loop
-    )
-
-
-    return jsonify({
-
-        "success": True,
-
-        "message":
-            "Webcam loop dimulai"
-    })
-
-
-# ======================================================
-# CAMERA STOP
-# ======================================================
-
-@app.route(
-    "/api/camera/stop",
-    methods=["POST"]
-)
+@app.route("/api/camera/stop", methods=["POST"])
+@require_token
 def camera_stop():
-
     global camera_running
-
     camera_running = False
+    return jsonify({"success": True, "message": "Kamera akan dihentikan"})
 
 
-    return jsonify({
-
-        "success": True,
-
-        "message":
-            "Webcam loop akan dihentikan"
-    })
-
-
-# ======================================================
-# CAMERA STATUS
-# ======================================================
-
-@app.route(
-    "/api/camera/status",
-    methods=["GET"]
-)
+@app.route("/api/camera/status", methods=["GET"])
+@require_token
 def camera_status():
-
-    return jsonify({
-
-        "camera_running":
-            camera_running
-    })
+    return jsonify({"camera_running": camera_running})
 
 
 # ======================================================
 # SOCKET.IO EVENTS
 # ======================================================
-
 @socketio.on("connect")
-def on_connect():
-
-    print(
-        f"[+] Client connected: "
-        f"{request.sid}"
-    )
-
-
-    emit(
-        "connected",
-        {
-            "status":
-                "connected",
-
-            "sid":
-                request.sid
-        }
-    )
+def on_connect(auth=None):
+    token = auth.get("token") if isinstance(auth, dict) else None
+    if not token_ok(token):
+        print("[WS] Koneksi ditolak: token salah")
+        return False
+    print(f"[+] Client connected: {request.sid}")
+    emit("connected", {"status": "connected", "sid": request.sid})
+    emit("device_state", generator.snapshot())
 
 
 @socketio.on("disconnect")
 def on_disconnect():
-
-    print(
-        f"[-] Client disconnected: "
-        f"{request.sid}"
-    )
+    print(f"[-] Client disconnected: {request.sid}")
 
 
-    previous_keypoints_map.pop(
-        request.sid,
-        None
-    )
-
-
-@socketio.on("verify")
-def on_verify(data):
-
+def _handle_image(data, reply_event):
     try:
-
-        image_b64 = data.get(
-            "image_b64"
-        )
-
-        result = detect_person_pose(
-            image_b64,
-            request.sid
-        )
-
-
-        emit(
-            "verify_result",
-            result
-        )
-
-
+        img = decode_base64_image((data or {}).get("image_b64"))
+        result, _ = process_frame(img, request.sid)
+        emit(reply_event, result)
     except Exception as e:
-
-        emit(
-            "verify_result",
-            {
-                "status":
-                    "ERROR",
-
-                "error":
-                    str(e)
-            }
-        )
+        emit(reply_event, {"status": "ERROR", "error": str(e)})
 
 
 @socketio.on("frame")
 def on_frame(data):
+    _handle_image(data, "detection_result")
 
+
+@socketio.on("verify")
+def on_verify(data):
+    _handle_image(data, "verify_result")
+
+
+@socketio.on("set_mode")
+def on_set_mode(data):
+    data = data or {}
     try:
-
-        image_b64 = data.get(
-            "image_b64"
-        )
-
-
-        result = detect_person_pose(
-            image_b64,
-            request.sid
-        )
+        generator.set_mode(data.get("device", "all"), data.get("mode"))
+        socketio.emit("device_state", generator.snapshot())
+    except ValueError as e:
+        emit("server_error", {"event": "set_mode", "message": str(e)})
 
 
-        emit(
-            "detection_result",
-            result
-        )
+@socketio.on("device_control")
+def on_device_control(data):
+    data = data or {}
+    try:
+        publish_commands(generator.manual(data.get("device", "all"), data.get("command")))
+    except ValueError as e:
+        emit("server_error", {"event": "device_control", "message": str(e)})
 
 
-    except Exception as e:
-
-        emit(
-            "detection_result",
-            {
-                "status":
-                    "ERROR",
-
-                "error":
-                    str(e)
-            }
-        )
+@socketio.on("get_state")
+def on_get_state(_=None):
+    emit("device_state", generator.snapshot())
 
 
 @socketio.on("ping")
-def on_ping(_):
-
-    emit(
-        "pong",
-        {
-            "timestamp":
-                time.time()
-        }
-    )
-
-
-@socketio.on("broadcast")
-def on_broadcast(data):
-
-    emit(
-        "broadcast",
-        data,
-        broadcast=True
-    )
+def on_ping(_=None):
+    emit("pong", {"timestamp": time.time()})
 
 
 # ======================================================
-# RUN SERVER
+# RUN
 # ======================================================
+def main():
+    setup_mqtt()
+    if CAMERA_AUTOSTART:
+        start_camera()
+    socketio.run(app, host="0.0.0.0", port=PORT, debug=False)
+
 
 if __name__ == "__main__":
-
-    # Mulai webcam otomatis
-    socketio.start_background_task(
-        webcam_loop
-    )
-
-
-    socketio.run(
-        app,
-
-        # Gunakan 0.0.0.0 agar Raspberry Pi
-        # dan device lain di jaringan bisa akses
-        host="0.0.0.0",
-
-        port=8001,
-
-        debug=False
-    )
+    main()

@@ -1,4 +1,6 @@
-from concurrent.futures import process
+import os
+
+from dotenv import load_dotenv
 
 import eventlet
 eventlet.monkey_patch()
@@ -27,9 +29,10 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 # ======================================================
 # SUPABASE
 # ======================================================
-SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL
-SUPABASE_SERVICE_KEY = process.env.EXPO_PUBLIC_SUPABASE_SERVICE_ROLE_KEY
-SUPABASE_ANON_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY
+load_dotenv()
+SUPABASE_URL = os.getenv("EXPO_PUBLIC_SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("EXPO_PUBLIC_SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_ANON_KEY = os.getenv("EXPO_PUBLIC_SUPABASE_ANON_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 supabase_auth: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
@@ -46,11 +49,12 @@ previous_keypoints_map = {}
 # ======================================================
 # MQTT CONFIG
 # ======================================================
-MQTT_BROKER     = process.env.MQTT_BROKER
-MQTT_PORT       = int(process.env.MQTT_PORT) if process.env.MQTT_PORT else 8883
-MQTT_USERNAME   = process.env.MQTT_USERNAME
-MQTT_PASSWORD   = process.env.MQTT_PASSWORD
-DEVICE_ID       = process.env.DEVICE_ID
+load_dotenv()
+MQTT_BROKER     = os.getenv("MQTT_BROKER")
+MQTT_PORT       = int(os.getenv("MQTT_PORT")) if os.getenv("MQTT_PORT") else 8883
+MQTT_USERNAME   = os.getenv("MQTT_USERNAME")
+MQTT_PASSWORD   = os.getenv("MQTT_PASSWORD")
+DEVICE_ID       = os.getenv("DEVICE_ID")
 
 # Topics
 MQTT_TOPIC_DETECTION = f"{DEVICE_ID}/detection/status"   # publish hasil deteksi pose
