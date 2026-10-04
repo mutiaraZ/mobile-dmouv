@@ -19,7 +19,7 @@ import { fetchDeviceStatus, updateLampState } from "../api/api";
 import LampIcon from "../assets/images/leddua.svg";
 import { Colors } from "../constants/Colors";
 import { useLamp } from "../context/LampContext";
-import tailwindConfig from "../tailwind.config.js"; 
+import tailwindConfig from "../tailwind.config.js";
 
 if (
   Platform.OS === "android" &&

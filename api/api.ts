@@ -1,76 +1,110 @@
-type PersonStatus = "detected" | "not-detected";
-type LampStatus = "on" | "off";
-type FanStatus = "on" | "off";
+import { API_TOKEN, BACKEND_URL } from "./config";
 
-// Satu sumber kebenaran untuk person status
-let sharedPersonStatus: PersonStatus = "not-detected";
+export type PersonStatus = "detected" | "not-detected";
+export type LampStatus = "on" | "off";
+export type FanStatus = "on" | "off";
 
-// ✅ Fungsi ini dipanggil dari CameraStream saat deteksi berhasil
-export const updatePersonStatus = (status: PersonStatus) => {
-  sharedPersonStatus = status;
-  mockLampDatabase.personStatus = status;
-  mockFanDatabase.personStatus = status;
-  console.log("[API] Person status updated:", status);
+type DeviceName = "lamp" | "fan";
+
+// Bentuk state dari backend (CommandGenerator.snapshot())
+type BackendState = {
+  person_detected: boolean;
+  devices: Record<DeviceName, { mode: "auto" | "manual"; state: "ON" | "OFF" | null }>;
 };
 
-let mockLampDatabase: {
-  lampStatus: LampStatus;
-  personStatus: PersonStatus;
-  isAutoMode: boolean;
-} = {
-  lampStatus: "off",
-  personStatus: sharedPersonStatus,
-  isAutoMode: false,
+// ------------------------------------------------------------------
+// HTTP helper
+// ------------------------------------------------------------------
+const request = async <T>(
+  path: string,
+  options: { method?: "GET" | "POST"; body?: unknown } = {}
+): Promise<T> => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const res = await fetch(`${BACKEND_URL}${path}`, {
+      method: options.method ?? "GET",
+      headers: {
+        "Content-Type": "application/json",
+        ...(API_TOKEN ? { "X-Auth-Token": API_TOKEN } : {}),
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: controller.signal,
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.success === false) {
+      throw new Error(data.message || `HTTP ${res.status}`);
+    }
+    return data as T;
+  } finally {
+    clearTimeout(timer);
+  }
 };
 
-let mockFanDatabase: {
-  fanStatus: FanStatus;
-  personStatus: PersonStatus;
-  isAutoMode: boolean;
-} = {
-  fanStatus: "off",
-  personStatus: sharedPersonStatus,
-  isAutoMode: false,
+const getState = async (): Promise<BackendState> => {
+  const data = await request<{ state: BackendState }>("/api/device/status");
+  return data.state;
 };
 
-export const fetchDeviceStatus = (): Promise<typeof mockLampDatabase> => {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      mockLampDatabase.personStatus = sharedPersonStatus;
-      resolve(mockLampDatabase);
-    }, 500);
-  });
+const toPerson = (s: BackendState): PersonStatus =>
+  s.person_detected ? "detected" : "not-detected";
+
+// ------------------------------------------------------------------
+// LAMPU
+// ------------------------------------------------------------------
+export const fetchDeviceStatus = async () => {
+  const s = await getState();
+  return {
+    lampStatus: (s.devices.lamp.state === "ON" ? "on" : "off") as LampStatus,
+    personStatus: toPerson(s),
+    isAutoMode: s.devices.lamp.mode === "auto",
+  };
 };
 
 export const updateLampState = (newState: {
   lampStatus?: LampStatus;
   isAutoMode?: boolean;
-}): Promise<{ success: boolean }> => {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      mockLampDatabase = { ...mockLampDatabase, ...newState };
-      resolve({ success: true });
-    }, 300);
-  });
-};
+}) => updateDevice("lamp", newState.lampStatus, newState.isAutoMode);
 
-export const fetchFanStatus = (): Promise<typeof mockFanDatabase> => {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      mockFanDatabase.personStatus = sharedPersonStatus;
-      resolve(mockFanDatabase);
-    }, 500);
-  });
+// ------------------------------------------------------------------
+// KIPAS
+// ------------------------------------------------------------------
+export const fetchFanStatus = async () => {
+  const s = await getState();
+  return {
+    fanStatus: (s.devices.fan.state === "ON" ? "on" : "off") as FanStatus,
+    personStatus: toPerson(s),
+    isAutoMode: s.devices.fan.mode === "auto",
+  };
 };
 
 export const updateFanState = (newState: {
   fanStatus?: FanStatus;
   isAutoMode?: boolean;
-}): Promise<{ success: boolean }> => {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      mockFanDatabase = { ...mockFanDatabase, ...newState };
-      resolve({ success: true });
-    }, 300);
-  });
+}) => updateDevice("fan", newState.fanStatus, newState.isAutoMode);
+
+// ------------------------------------------------------------------
+// Kirim perintah ke backend (HTTP). Backend yang meneruskan ke Raspi via Socket.IO.
+// ------------------------------------------------------------------
+const updateDevice = async (
+  device: DeviceName,
+  power?: "on" | "off",
+  isAutoMode?: boolean
+): Promise<{ success: boolean }> => {
+  if (isAutoMode !== undefined) {
+    await request("/api/device/mode", {
+      method: "POST",
+      body: { device, mode: isAutoMode ? "auto" : "manual" },
+    });
+  }
+  if (power !== undefined) {
+    // Perintah manual: otomatis memindahkan perangkat ke mode manual di backend
+    await request("/api/device/control", {
+      method: "POST",
+      body: { device, command: power.toUpperCase() },
+    });
+  }
+  return { success: true };
 };

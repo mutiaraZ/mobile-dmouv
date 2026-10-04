@@ -73,15 +73,20 @@ export default function CameraStream() {
   }
 
   // Skala bounding box dari ukuran gambar asli ke ukuran tampilan di layar
-  const scaleX = displaySize.width / (frame.image_width || 1);
-  const scaleY = displaySize.height / (frame.image_height || 1);
+  // Gambar memakai resizeMode="contain" (tidak terpotong), jadi bounding box
+  // harus dihitung dengan skala seragam + offset letterbox agar tetap pas.
+  const imgW = frame.image_width || 1;
+  const imgH = frame.image_height || 1;
+  const scale = Math.min(displaySize.width / imgW, displaySize.height / imgH);
+  const offsetX = (displaySize.width - imgW * scale) / 2;
+  const offsetY = (displaySize.height - imgH * scale) / 2;
 
   return (
     <View style={styles.container} onLayout={handleLayout}>
       <Image
         source={{ uri: `data:image/jpeg;base64,${frame.image_b64}` }}
         style={StyleSheet.absoluteFill}
-        resizeMode="cover"
+        resizeMode="contain"
       />
 
       {frame.boxes.map((box, index) => {
@@ -92,10 +97,10 @@ export default function CameraStream() {
             style={[
               styles.boundingBox,
               {
-                left: x1 * scaleX,
-                top: y1 * scaleY,
-                width: (x2 - x1) * scaleX,
-                height: (y2 - y1) * scaleY,
+                left: offsetX + x1 * scale,
+                top: offsetY + y1 * scale,
+                width: (x2 - x1) * scale,
+                height: (y2 - y1) * scale,
               },
             ]}
           >

@@ -27,6 +27,11 @@ from model import CommandGenerator, PoseModel, decode_base64_image  # noqa: E402
 PORT = int(os.getenv("PORT", "8001"))
 WS_AUTH_TOKEN = os.getenv("WS_AUTH_TOKEN", "")  # kosong = tanpa auth
 
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+
 CAMERA_AUTOSTART = os.getenv("CAMERA_AUTOSTART", "1") == "1"
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 CAPTURE_INTERVAL = float(os.getenv("CAPTURE_INTERVAL", "0.2"))
