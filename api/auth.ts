@@ -1,3 +1,6 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { BACKEND_URL } from "./config";
+
 // ===============================
 // TIPE DATA
 // ===============================
@@ -14,9 +17,12 @@ export type User = {
 // ===============================
 // LOGIN KE BACKEND FLASK
 // ===============================
-export const login = async (email: string, password: string): Promise<User | null> => {
+export const login = async (
+  email: string,
+  password: string
+): Promise<User | null> => {
   try {
-    const res = await fetch("http://127.0.0.1:8001/api/auth/login", {
+    const res = await fetch(`${BACKEND_URL}/api/auth/login`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -51,9 +57,11 @@ export const login = async (email: string, password: string): Promise<User | nul
 // ===============================
 export const storeUserSession = async (token: string, role: string) => {
   try {
-    localStorage.setItem("token", token);
-    localStorage.setItem("role", role);
-    console.log("Session saved:", { token, role });
+    await AsyncStorage.multiSet([
+      ["token", token],
+      ["role", role],
+    ]);
+    console.log("Session saved:", { role });
   } catch (e) {
     console.error("Failed to save user session", e);
   }
@@ -62,16 +70,18 @@ export const storeUserSession = async (token: string, role: string) => {
 // ===============================
 // HAPUS SESSION
 // ===============================
-export const clearUserSession = () => {
-  localStorage.removeItem("token");
-  localStorage.removeItem("role");
-  localStorage.removeItem("user_id");
-  localStorage.removeItem("email");
+export const clearUserSession = async () => {
+  try {
+    await AsyncStorage.multiRemove(["token", "role", "user_id", "email"]);
+  } catch (e) {
+    console.error("Failed to clear user session", e);
+  }
 };
 
 // ===============================
 // CEK USER MASIH LOGIN
 // ===============================
-export const isLoggedIn = () => {
-  return localStorage.getItem("token") !== null;
+export const isLoggedIn = async (): Promise<boolean> => {
+  const token = await AsyncStorage.getItem("token");
+  return token !== null;
 };

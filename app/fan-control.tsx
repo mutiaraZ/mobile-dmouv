@@ -1,157 +1,19 @@
 import { Ionicons } from "@expo/vector-icons";
-import React, { useEffect, useRef, useState } from "react";
+import React from "react";
 import {
   ActivityIndicator,
-  Alert,
-  Animated,
-  LayoutAnimation,
-  Platform,
-  Pressable,
+  ScrollView,
   StatusBar,
   Text,
   TouchableOpacity,
-  UIManager,
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import resolveConfig from "tailwindcss/resolveConfig";
-import { fetchFanStatus, updateFanState } from "../api/api";
 import FanIcon from "../assets/images/fandua.svg";
+import OnOffSwitch from "../components/OnOffSwitch";
 import { Colors } from "../constants/Colors";
 import { useFan } from "../context/FanContext";
-import tailwindConfig from "../tailwind.config.js";
-
-if (
-  Platform.OS === "android" &&
-  UIManager.setLayoutAnimationEnabledExperimental
-) {
-  UIManager.setLayoutAnimationEnabledExperimental(true);
-}
-
-const fullConfig = resolveConfig(tailwindConfig);
-const themeColors = fullConfig.theme.colors as any;
-
-type PersonStatus = "detected" | "not-detected";
-type FanStatus = "on" | "off";
-
-const TRACK_WIDTH = 76;
-const TRACK_HEIGHT = 40;
-const THUMB_SIZE = 32;
-const PADDING = 4;
-
-interface CustomSwitchProps {
-  value: boolean;
-  onValueChange: () => void;
-  disabled?: boolean;
-}
-
-const CustomSwitch: React.FC<CustomSwitchProps> = ({
-  value,
-  onValueChange,
-  disabled = false,
-}) => {
-  const animatedValue = useRef(new Animated.Value(value ? 1 : 0)).current;
-
-  useEffect(() => {
-    Animated.spring(animatedValue, {
-      toValue: value ? 1 : 0,
-      friction: 7,
-      tension: 100,
-      useNativeDriver: false,
-    }).start();
-  }, [value, animatedValue]);
-
-  const translateX = animatedValue.interpolate({
-    inputRange: [0, 1],
-    outputRange: [PADDING, TRACK_WIDTH - THUMB_SIZE - PADDING],
-  });
-
-  const backgroundColor = animatedValue.interpolate({
-    inputRange: [0, 1],
-    outputRange: [themeColors.border, themeColors.primary],
-  });
-
-  const sunIconOpacity = animatedValue.interpolate({ inputRange: [0, 1], outputRange: [0, 1] });
-  const sunIconScale = animatedValue.interpolate({ inputRange: [0, 0.5, 1], outputRange: [0, 0.5, 1] });
-  const moonIconOpacity = animatedValue.interpolate({ inputRange: [0, 1], outputRange: [1, 0] });
-  const moonIconScale = animatedValue.interpolate({ inputRange: [0, 0.5, 1], outputRange: [1, 0.5, 0] });
-
-  return (
-    <Pressable
-      onPress={onValueChange}
-      disabled={disabled}
-      hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-    >
-      <Animated.View
-        className={`rounded-full justify-center ${disabled ? "opacity-50" : ""}`}
-        style={{ width: TRACK_WIDTH, height: TRACK_HEIGHT, backgroundColor }}
-      >
-        <Animated.View
-          className="absolute bg-white justify-center items-center shadow-lg"
-          style={{
-            width: THUMB_SIZE,
-            height: THUMB_SIZE,
-            borderRadius: THUMB_SIZE / 2,
-            transform: [{ translateX }],
-            elevation: 5,
-          }}
-        >
-          <Animated.View className="absolute" style={{ opacity: moonIconOpacity, transform: [{ scale: moonIconScale }] }}>
-            <Ionicons name="moon" size={18} color={themeColors.textLight} />
-          </Animated.View>
-          <Animated.View className="absolute" style={{ opacity: sunIconOpacity, transform: [{ scale: sunIconScale }] }}>
-            <Ionicons name="sunny" size={18} color={themeColors.lampOnColor} />
-          </Animated.View>
-        </Animated.View>
-      </Animated.View>
-    </Pressable>
-  );
-};
-
-const useFanDeviceSync = () => {
-  const { setIsAutoMode } = useFan();
-  const [fanStatus, setFanStatus] = useState<FanStatus>("off");
-  const [personStatus, setPersonStatus] = useState<PersonStatus>("not-detected");
-  const [isLoading, setIsLoading] = useState(true);
-
-  useEffect(() => {
-    const getInitialStatus = async () => {
-      try {
-        const data = await fetchFanStatus();
-        LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-        setFanStatus(data.fanStatus);
-        setPersonStatus(data.personStatus);
-        setIsAutoMode(data.isAutoMode);
-      } catch (error) {
-        console.error("Fetch initial fan status error:", error);
-        Alert.alert("Error", "Failed to fetch initial status from the server.");
-      } finally {
-        setIsLoading(false);
-      }
-    };
-
-    getInitialStatus();
-
-    const intervalId = setInterval(async () => {
-      try {
-        const data = await fetchFanStatus();
-        setPersonStatus((prevStatus) => {
-          if (data.personStatus !== prevStatus) {
-            LayoutAnimation.configureNext(LayoutAnimation.Presets.spring);
-            return data.personStatus;
-          }
-          return prevStatus;
-        });
-      } catch (error) {
-        console.error("Fetch fan status update error:", error);
-      }
-    }, 5000);
-
-    return () => clearInterval(intervalId);
-  }, [setIsAutoMode]);
-
-  return { fanStatus, setFanStatus, personStatus, isLoading };
-};
+import { useDeviceControl } from "../context/hooks/useDeviceControl";
 
 const StatusItem: React.FC<{
   icon: keyof typeof Ionicons.glyphMap;
@@ -176,56 +38,28 @@ const StatusItem: React.FC<{
 export default function FanControlScreen() {
   const insets = useSafeAreaInsets();
   const { isAutoMode, setIsAutoMode } = useFan();
-  const { fanStatus, setFanStatus, personStatus, isLoading } = useFanDeviceSync();
+  const {
+    power,
+    personStatus,
+    offInSec,
+    isLoading,
+    isSending,
+    error,
+    setAutoMode,
+    setPowerState,
+  } = useDeviceControl("fan", setIsAutoMode);
 
-  // useEffect for auto mode logic
-  useEffect(() => {
-    if (isLoading || !isAutoMode) return;
+  const isFanOn = power === "on";
 
-    const performAutoUpdate = (newStatus: FanStatus) => {
-      LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-      setFanStatus(newStatus);
-      updateFanState({ fanStatus: newStatus }).catch((err) =>
-        console.error("Auto mode update failed:", err)
-      );
-    };
-
-    if (personStatus === "detected" && fanStatus === "off") {
-      performAutoUpdate("on");
-    } else if (personStatus === "not-detected" && fanStatus === "on") {
-      performAutoUpdate("off");
-    }
-  }, [personStatus, isAutoMode, isLoading, fanStatus, setFanStatus]);
-
-  const handleAutoModeToggle = async () => {
-    const newMode = !isAutoMode;
-    LayoutAnimation.configureNext(LayoutAnimation.Presets.spring);
-    setIsAutoMode(newMode); 
-    try {
-      await updateFanState({ isAutoMode: newMode });
-    } catch (error) {
-      console.error("Update auto mode failed:", error);
-      Alert.alert("Error", "Failed to update auto mode.");
-      setIsAutoMode(!newMode); 
-    }
+  const handleAutoModeToggle = () => {
+    if (isSending) return;
+    setAutoMode(!isAutoMode);
   };
 
-
-  const handleFanToggle = async () => {
-    if (isAutoMode) return;
-    const newStatus = fanStatus === "on" ? "off" : "on";
-    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-    setFanStatus(newStatus);
-    try {
-      await updateFanState({ fanStatus: newStatus });
-    } catch (error) {
-      console.error("Update fan status failed:", error);
-      Alert.alert("Error", "Failed to update fan status.");
-      setFanStatus(fanStatus);
-    }
+  const handleFanToggle = () => {
+    if (isAutoMode || isSending) return;
+    setPowerState(isFanOn ? "off" : "on");
   };
-
-  const isFanOn = fanStatus === "on";
 
   if (isLoading) {
     return (
@@ -236,20 +70,37 @@ export default function FanControlScreen() {
     );
   }
 
+  const showCountdown =
+    isAutoMode && isFanOn && personStatus === "not-detected" && offInSec !== null;
+
   return (
-    <View className="flex-1 bg-secondary" style={{ paddingTop: insets.top + 50 }}>
+    <ScrollView
+      className="flex-1 bg-secondary"
+      contentContainerStyle={{ flexGrow: 1, paddingTop: insets.top + 50 }}
+    >
       <StatusBar barStyle="dark-content" backgroundColor="transparent" translucent />
 
       {/* Header Section */}
       <View className="items-center justify-start px-5">
-        <Text className="font-poppins-semibold text-3xl font-bold text-white mt-0.5" style={{ textShadowColor: "rgba(0, 0, 0, 0.2)", textShadowOffset: { width: 1, height: 2 }, textShadowRadius: 3 }}>
+        <Text
+          className="font-poppins-semibold text-3xl font-bold text-white mt-0.5"
+          style={{
+            textShadowColor: "rgba(0, 0, 0, 0.2)",
+            textShadowOffset: { width: 1, height: 2 },
+            textShadowRadius: 3,
+          }}
+        >
           Smart Fan
         </Text>
         <Text className="font-poppins-regular text-[15px] text-textLight mt-0.5">
           Control your smart cooler
         </Text>
         <View className="w-52 h-52 justify-center items-center mt-2.5 mb-12 p-4">
-          <FanIcon width="120%" height="120%" fill={isFanOn ? Colors.primary : Colors.lampOffColor} />
+          <FanIcon
+            width="120%"
+            height="120%"
+            fill={isFanOn ? Colors.primary : Colors.lampOffColor}
+          />
         </View>
       </View>
 
@@ -260,18 +111,44 @@ export default function FanControlScreen() {
 
           {/* Manual Power Button */}
           <TouchableOpacity
-            className={`w-24 h-24 rounded-full justify-center items-center bg-secondary shadow-lg shadow-primary/30 mb-2.5 border-2 border-white ${isAutoMode ? "bg-border" : ""}`}
+            className={`w-24 h-24 rounded-full justify-center items-center shadow-lg shadow-primary/30 mb-2.5 border-2 border-white ${
+              isAutoMode ? "bg-border" : "bg-secondary"
+            }`}
             onPress={handleFanToggle}
-            disabled={isAutoMode}
+            disabled={isAutoMode || isSending}
             activeOpacity={0.7}
           >
-            <Ionicons name="power" size={36} color={isFanOn && !isAutoMode ? Colors.primary : Colors.white} />
+            <Ionicons
+              name="power"
+              size={36}
+              color={isFanOn && !isAutoMode ? Colors.primary : Colors.white}
+            />
           </TouchableOpacity>
-          <Text className={`font-poppins-semibold text-base font-semibold mb-6 ${isFanOn ? "text-greenDot" : "text-textLight"}`}>
+          <Text
+            className={`font-poppins-semibold text-base font-semibold mb-2 ${
+              isFanOn ? "text-greenDot" : "text-textLight"
+            }`}
+          >
             Fan {isFanOn ? "On" : "Off"}
+          </Text>
+          <Text className="font-poppins-regular text-xs text-textLight mb-4 text-center">
+            {isAutoMode
+              ? "Automatic mode is on. Turn it off to use the power button."
+              : "Manual mode. The fan only changes when you press the button."}
           </Text>
 
           <View className="w-full h-px bg-border mb-5" />
+
+          {error && (
+            <View className="w-full bg-error rounded-2xl p-3 mb-4">
+              <Text
+                className="font-poppins-regular text-xs text-center"
+                style={{ color: Colors.redDot }}
+              >
+                {error}
+              </Text>
+            </View>
+          )}
 
           {/* Status Panel */}
           <View className="flex-row w-full justify-around bg-[#F4F3F3] rounded-2xl p-4 mb-5">
@@ -290,9 +167,15 @@ export default function FanControlScreen() {
             />
           </View>
 
-          {/* Auto Mode Panel */}
+          {showCountdown && (
+            <Text className="font-poppins-regular text-xs text-textLight mb-5 text-center">
+              No person detected. Fan turns off in {offInSec}s.
+            </Text>
+          )}
+
+          {/* Automatic Mode Panel */}
           <View className="flex-row justify-between items-center bg-[#F4F3F3] rounded-2xl p-5 w-full">
-            <View>
+            <View className="flex-1 pr-3">
               <Text className="font-poppins-semibold text-[15px] font-semibold text-text">
                 Automatic Mode
               </Text>
@@ -300,10 +183,14 @@ export default function FanControlScreen() {
                 Control fan based on detection
               </Text>
             </View>
-            <CustomSwitch value={isAutoMode} onValueChange={handleAutoModeToggle} />
+            <OnOffSwitch
+              value={isAutoMode}
+              onValueChange={handleAutoModeToggle}
+              disabled={isSending}
+            />
           </View>
         </View>
       </View>
-    </View>
+    </ScrollView>
   );
 }

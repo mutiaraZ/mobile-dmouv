@@ -1,15 +1,26 @@
 import { API_TOKEN, BACKEND_URL } from "./config";
 
 export type PersonStatus = "detected" | "not-detected";
-export type LampStatus = "on" | "off";
-export type FanStatus = "on" | "off";
+export type PowerStatus = "on" | "off";
+export type DeviceName = "lamp" | "fan";
 
-type DeviceName = "lamp" | "fan";
-
-// Bentuk state dari backend (CommandGenerator.snapshot())
 type BackendState = {
   person_detected: boolean;
-  devices: Record<DeviceName, { mode: "auto" | "manual"; state: "ON" | "OFF" | null }>;
+  devices: Record<
+    DeviceName,
+    {
+      mode: "auto" | "manual";
+      state: "ON" | "OFF" | null;
+      off_in_sec?: number | null;
+    }
+  >;
+};
+
+export type DeviceSnapshot = {
+  power: PowerStatus;
+  personStatus: PersonStatus;
+  isAutoMode: boolean;
+  offInSec: number | null;
 };
 
 // ------------------------------------------------------------------
@@ -43,68 +54,38 @@ const request = async <T>(
   }
 };
 
-const getState = async (): Promise<BackendState> => {
-  const data = await request<{ state: BackendState }>("/api/device/status");
-  return data.state;
-};
-
-const toPerson = (s: BackendState): PersonStatus =>
-  s.person_detected ? "detected" : "not-detected";
-
 // ------------------------------------------------------------------
-// LAMPU
+// Baca status satu perangkat (lamp / fan)
 // ------------------------------------------------------------------
-export const fetchDeviceStatus = async () => {
-  const s = await getState();
+export const fetchDevice = async (device: DeviceName): Promise<DeviceSnapshot> => {
+  const { state } = await request<{ state: BackendState }>("/api/device/status");
+  const dev = state.devices[device];
   return {
-    lampStatus: (s.devices.lamp.state === "ON" ? "on" : "off") as LampStatus,
-    personStatus: toPerson(s),
-    isAutoMode: s.devices.lamp.mode === "auto",
+    power: dev.state === "ON" ? "on" : "off",
+    personStatus: state.person_detected ? "detected" : "not-detected",
+    isAutoMode: dev.mode === "auto",
+    offInSec: dev.off_in_sec ?? null,
   };
 };
 
-export const updateLampState = (newState: {
-  lampStatus?: LampStatus;
-  isAutoMode?: boolean;
-}) => updateDevice("lamp", newState.lampStatus, newState.isAutoMode);
-
 // ------------------------------------------------------------------
-// KIPAS
+// Kirim perintah. Backend meneruskan ke Raspi via Socket.IO / MQTT.
+// Perintah power otomatis memindahkan perangkat ke mode manual di backend.
 // ------------------------------------------------------------------
-export const fetchFanStatus = async () => {
-  const s = await getState();
-  return {
-    fanStatus: (s.devices.fan.state === "ON" ? "on" : "off") as FanStatus,
-    personStatus: toPerson(s),
-    isAutoMode: s.devices.fan.mode === "auto",
-  };
-};
-
-export const updateFanState = (newState: {
-  fanStatus?: FanStatus;
-  isAutoMode?: boolean;
-}) => updateDevice("fan", newState.fanStatus, newState.isAutoMode);
-
-// ------------------------------------------------------------------
-// Kirim perintah ke backend (HTTP). Backend yang meneruskan ke Raspi via Socket.IO.
-// ------------------------------------------------------------------
-const updateDevice = async (
+export const updateDevice = async (
   device: DeviceName,
-  power?: "on" | "off",
-  isAutoMode?: boolean
-): Promise<{ success: boolean }> => {
-  if (isAutoMode !== undefined) {
+  payload: { power?: PowerStatus; isAutoMode?: boolean }
+): Promise<void> => {
+  if (payload.isAutoMode !== undefined) {
     await request("/api/device/mode", {
       method: "POST",
-      body: { device, mode: isAutoMode ? "auto" : "manual" },
+      body: { device, mode: payload.isAutoMode ? "auto" : "manual" },
     });
   }
-  if (power !== undefined) {
-    // Perintah manual: otomatis memindahkan perangkat ke mode manual di backend
+  if (payload.power !== undefined) {
     await request("/api/device/control", {
       method: "POST",
-      body: { device, command: power.toUpperCase() },
+      body: { device, command: payload.power.toUpperCase() },
     });
   }
-  return { success: true };
 };
