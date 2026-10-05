@@ -1,10 +1,26 @@
-flask
-flask-cors
-flask-socketio
-eventlet
-python-dotenv
-paho-mqtt<2
-supabase
-numpy
-opencv-python-headless
+# ==========================================================
+# DMouv Backend - Python 3.10 (disarankan; hindari 3.12+, eventlet sering bermasalah)
+# Install: pip install -r requirements.txt
+# Jalankan: python server1.py
+# ==========================================================
+
+# --- Web server & realtime ---
+flask>=3.0,<4.0
+flask-cors>=4.0
+flask-socketio>=5.3,<6.0
+eventlet>=0.35
+
+# --- Konfigurasi (.env) ---
+python-dotenv>=1.0
+
+# --- MQTT ---
+# Wajib di bawah v2: kode memakai mqtt.Client(client_id=..., protocol=...) gaya lama
+paho-mqtt>=1.6,<2.0
+
+# --- Login (Supabase) ---
+supabase>=2.0
+
+# --- Deteksi pose (YOLO11n-pose via NCNN) ---
+numpy>=1.24,<2.0
+opencv-python-headless>=4.8
 ncnn
