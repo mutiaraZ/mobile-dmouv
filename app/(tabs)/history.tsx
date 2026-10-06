@@ -1,6 +1,9 @@
+import { useHistory } from "@/context/hooks/useHistory";
 import { Ionicons } from "@expo/vector-icons";
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
+  ActivityIndicator,
+  RefreshControl,
   ScrollView,
   Text,
   TextInput,
@@ -23,60 +26,6 @@ type LogType =
   | "fan-off"
   | "schedule"
   | "automatic";
-
-const DUMMY_HISTORY = [
-  {
-    date: "Wednesday, 15 August 2025",
-    logs: [
-      { type: "lamp-off", message: "Lights are now OFF", time: "23:00 PM" },
-      { type: "fan-on", message: "Fan has been activated", time: "22:15 PM" },
-      {
-        type: "motion",
-        message: "Motion detected around the device",
-        time: "22:15 PM",
-      },
-      { type: "lamp-on", message: "Lights are now ON", time: "19:30 PM" },
-      { type: "fan-off", message: "Fan has been turned off", time: "15:05 PM" },
-    ],
-  },
-  {
-    date: "Thursday, 14 August 2025",
-    logs: [
-      { type: "lamp-off", message: "Lights are now OFF", time: "21:45 PM" },
-      {
-        type: "motion",
-        message: "Motion detected around the device",
-        time: "16:10 PM",
-      },
-      { type: "lamp-on", message: "Lights are now ON", time: "16:09 PM" },
-    ],
-  },
-  {
-    date: "Friday, 13 August 2025",
-    logs: [
-      {
-        type: "schedule",
-        message: "Fan schedule activated: ON",
-        time: "18:00 PM",
-      },
-      {
-        type: "automatic",
-        message: "Lamp turned on automatically",
-        time: "17:30 PM",
-      },
-      {
-        type: "fan-on",
-        message: "Fan started automatically",
-        time: "14:00 PM",
-      },
-      {
-        type: "motion",
-        message: "Motion detected in the morning",
-        time: "08:30 AM",
-      },
-    ],
-  },
-];
 
 type LogItemProps = { type: LogType; message: string; time: string };
 
@@ -129,7 +78,7 @@ const logStyleConfig: Record<
 };
 
 const LogItem: React.FC<LogItemProps> = ({ type, message, time }) => {
-  const style = logStyleConfig[type];
+  const style = logStyleConfig[type] ?? logStyleConfig.automatic;
   return (
     <View
       className="flex-row items-center rounded-2xl p-3 mb-2.5 border-l-4"
@@ -170,6 +119,18 @@ export default function HistoryScreen() {
   const [currentPage, setCurrentPage] = useState(1);
   const DAYS_PER_PAGE = 2;
 
+  const {
+    days,
+    loading,
+    refreshing,
+    loadingMore,
+    hasMore,
+    error,
+    live,
+    refresh,
+    loadMore,
+  } = useHistory();
+
   const filterGroups: FilterGroup[] = [
     {
       title: "General",
@@ -197,16 +158,23 @@ export default function HistoryScreen() {
   ];
 
   const getFilteredData = () => {
-    return DUMMY_HISTORY.map((day) => ({
-      ...day,
-      logs: day.logs.filter((log) => {
-        const matchesFilter = filterType === "All" || log.type === filterType;
-        const matchesSearch =
-          log.message.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          day.date.toLowerCase().includes(searchQuery.toLowerCase());
-        return matchesFilter && matchesSearch;
-      }),
-    })).filter((day) => day.logs.length > 0);
+    const q = searchQuery.toLowerCase();
+    return days
+      .map((day) => ({
+        ...day,
+        logs: day.logs.filter((log) => {
+          const matchesFilter =
+            filterType === "All" ||
+            (filterType === "automatic"
+              ? log.source === "auto"
+              : log.type === filterType);
+          const matchesSearch =
+            log.message.toLowerCase().includes(q) ||
+            day.date.toLowerCase().includes(q);
+          return matchesFilter && matchesSearch;
+        }),
+      }))
+      .filter((day) => day.logs.length > 0);
   };
 
   const filteredHistory = getFilteredData();
@@ -214,6 +182,11 @@ export default function HistoryScreen() {
   const startIndex = (currentPage - 1) * DAYS_PER_PAGE;
   const endIndex = startIndex + DAYS_PER_PAGE;
   const paginatedDays = filteredHistory.slice(startIndex, endIndex);
+
+  // Jaga halaman tetap valid kalau jumlah hari berubah (event live / filter)
+  useEffect(() => {
+    if (currentPage > Math.max(1, totalPages)) setCurrentPage(1);
+  }, [totalPages, currentPage]);
 
   const handleSelectFilter = (selectedFilter: FilterType) => {
     setFilterType(selectedFilter);
@@ -237,6 +210,17 @@ export default function HistoryScreen() {
         >
           Room History
         </Text>
+
+        <View className="flex-row items-center mb-3 -mt-3">
+          <View
+            className="w-2.5 h-2.5 rounded-full mr-2"
+            style={{ backgroundColor: live ? Colors.greenDot : Colors.redDot }}
+          />
+          <Text className="font-roboto-regular text-[12px] text-textLight">
+            {live ? "Live" : "Offline - pull down to refresh"}
+          </Text>
+        </View>
+
         <View className="flex-row items-center bg-white rounded-2xl px-4 h-14 shadow-md shadow-black/10">
           <Ionicons name="search-outline" size={22} color={Colors.textLight} />
           <TextInput
@@ -265,20 +249,42 @@ export default function HistoryScreen() {
           paddingTop: 10,
           paddingBottom: 100,
         }}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={refresh}
+            tintColor={Colors.primary}
+          />
+        }
       >
-        {paginatedDays.length > 0 ? (
+        {loading ? (
+          <View className="items-center pt-20">
+            <ActivityIndicator size="large" color={Colors.primary} />
+          </View>
+        ) : error && days.length === 0 ? (
+          <View className="items-center justify-center pt-20">
+            <Ionicons
+              name="cloud-offline-outline"
+              size={50}
+              color={Colors.textLight}
+            />
+            <Text className="font-poppins-regular text-base text-textLight text-center mt-4">
+              {error}
+            </Text>
+          </View>
+        ) : paginatedDays.length > 0 ? (
           <>
-            {paginatedDays.map((day, index) => (
+            {paginatedDays.map((day) => (
               <View
-                key={index}
+                key={day.date}
                 className="bg-white rounded-2xl p-4 mb-5 shadow-lg shadow-black/10"
               >
                 <Text className="font-poppins-bold text-lg text-text mb-4 px-1">
                   {day.date}
                 </Text>
-                {day.logs.map((log, logIndex) => (
+                {day.logs.map((log) => (
                   <LogItem
-                    key={logIndex}
+                    key={log.id}
                     type={log.type as LogType}
                     message={log.message}
                     time={log.time}
@@ -343,6 +349,22 @@ export default function HistoryScreen() {
                   </Text>
                 </TouchableOpacity>
               </View>
+            )}
+
+            {hasMore && currentPage === totalPages && (
+              <TouchableOpacity
+                onPress={loadMore}
+                disabled={loadingMore}
+                className="items-center mt-4 p-3"
+              >
+                {loadingMore ? (
+                  <ActivityIndicator color={Colors.primary} />
+                ) : (
+                  <Text className="font-poppins-semibold text-[15px] text-primary">
+                    Load older history
+                  </Text>
+                )}
+              </TouchableOpacity>
             )}
           </>
         ) : (

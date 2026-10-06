@@ -26,7 +26,7 @@ export type DeviceSnapshot = {
 // ------------------------------------------------------------------
 // HTTP helper
 // ------------------------------------------------------------------
-const request = async <T>(
+export const request = async <T>(
   path: string,
   options: { method?: "GET" | "POST"; body?: unknown } = {}
 ): Promise<T> => {

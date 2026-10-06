@@ -1,6 +1,5 @@
 import { io, Socket } from "socket.io-client";
-
-const SERVER_URL = "http://192.168.246.17:8001";
+import { API_TOKEN, BACKEND_URL } from "../api/config";
 
 class SocketService {
   private socket: Socket | null = null;
@@ -9,13 +8,14 @@ class SocketService {
   // CONNECT
   // ============================================
   connect() {
-    if (this.socket?.connected) {
-      console.log("Socket already connected");
+    if (this.socket) {
+      // sudah dibuat (connected atau sedang reconnect otomatis)
       return;
     }
 
-    this.socket = io(SERVER_URL, {
+    this.socket = io(BACKEND_URL, {
       transports: ["websocket"],
+      auth: { token: API_TOKEN },
       reconnection: true,
       reconnectionAttempts: 999,
       reconnectionDelay: 1000,
@@ -98,6 +98,17 @@ class SocketService {
   // ============================================
   onBroadcast(callback: (data: any) => void) {
     this.socket?.on("broadcast", callback);
+  }
+
+  // ============================================
+  // HISTORY REALTIME
+  // ============================================
+  onHistoryEvent(callback: (row: any) => void) {
+    this.socket?.on("history_event", callback);
+  }
+
+  offHistoryEvent(callback: (row: any) => void) {
+    this.socket?.off("history_event", callback);
   }
 
   // ============================================

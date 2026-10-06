@@ -1,4 +1,3 @@
-
 import eventlet
 eventlet.monkey_patch()
 
@@ -6,7 +5,9 @@ import base64
 import hmac
 import json
 import os
+import queue
 import time
+from datetime import datetime, timezone
 from functools import wraps
 
 import cv2
@@ -36,6 +37,7 @@ CAMERA_AUTOSTART = os.getenv("CAMERA_AUTOSTART", "1") == "1"
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 CAPTURE_INTERVAL = float(os.getenv("CAPTURE_INTERVAL", "0.2"))
 STATUS_INTERVAL = float(os.getenv("STATUS_INTERVAL", "5"))
+MOTION_COOLDOWN = float(os.getenv("MOTION_COOLDOWN", "30"))  # detik, cegah spam log motion
 
 MQTT_BROKER = os.getenv("MQTT_BROKER", "")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
@@ -70,7 +72,7 @@ generator = CommandGenerator(
 )
 
 # ======================================================
-# SUPABASE (hanya untuk /api/auth/login) - key dibaca dari .env milik backend
+# SUPABASE (auth login + tabel device_history) - key dibaca dari .env milik backend
 # ======================================================
 supabase = supabase_auth = None
 _sb_url = os.getenv("SUPABASE_URL")
@@ -81,7 +83,84 @@ if _sb_url and _sb_service and _sb_anon:
     supabase = create_client(_sb_url, _sb_service)
     supabase_auth = create_client(_sb_url, _sb_anon)
 else:
-    print("[SUPABASE] env belum lengkap - /api/auth/login dinonaktifkan")
+    print("[SUPABASE] env belum lengkap - /api/auth/login dan history dinonaktifkan")
+
+
+# ======================================================
+# HISTORY (Supabase Postgres + push realtime via Socket.IO)
+# ======================================================
+_history_q = queue.Queue(maxsize=2000)
+_motion = {"prev": False, "last_log": 0.0}
+VALID_EVENT_TYPES = ("motion", "lamp-on", "lamp-off", "fan-on", "fan-off", "schedule")
+
+
+def log_event(event_type, message, device=None, source="system", reason=None, metadata=None):
+    """Antrikan event ke DB. Tidak memblok pipeline deteksi dan tidak pernah melempar error."""
+    if supabase is None:
+        return
+    row = {
+        "device_id": DEVICE_ID,
+        "event_type": event_type,
+        "device": device,
+        "source": source,
+        "message": message,
+        "reason": reason,
+        "metadata": metadata or {},
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        _history_q.put_nowait((row, 0))
+    except queue.Full:
+        print("[HISTORY] Antrian penuh, event dibuang")
+
+
+def history_worker():
+    while True:
+        row, attempt = _history_q.get()
+        try:
+            res = supabase.table("device_history").insert(row).execute()
+            saved = res.data[0] if res.data else row
+            socketio.emit("history_event", saved)  # push realtime ke semua app
+        except Exception as e:
+            print(f"[HISTORY] Gagal simpan (percobaan {attempt + 1}): {e}")
+            if attempt < 5:  # WiFi Raspi sempat putus -> coba lagi
+                socketio.sleep(2 ** attempt)
+                _history_q.put((row, attempt + 1))
+
+
+def describe_command(cmd):
+    """Perintah backend -> (event_type, message, source)."""
+    on = cmd["command"] == "ON"
+    device = cmd["device"]
+    manual = cmd["reason"] == "manual"
+    if device == "lamp":
+        if manual:
+            msg = "Lights are now ON" if on else "Lights are now OFF"
+        else:
+            msg = "Lamp turned on automatically" if on else "Lamp turned off automatically (no one around)"
+    else:
+        if manual:
+            msg = "Fan has been activated" if on else "Fan has been turned off"
+        else:
+            msg = "Fan started automatically" if on else "Fan turned off automatically (no one around)"
+    return f"{device}-{'on' if on else 'off'}", msg, ("manual" if manual else "auto")
+
+
+def log_commands(commands):
+    for cmd in commands:
+        event_type, msg, source = describe_command(cmd)
+        log_event(event_type, msg, device=cmd["device"], source=source, reason=cmd["reason"])
+
+
+def track_motion(client_id):
+    """Catat 'motion' saat orang TERKONFIRMASI muncul (transisi tidak ada -> ada), dengan cooldown."""
+    now = time.time()
+    person = generator._person
+    if person and not _motion["prev"] and now - _motion["last_log"] >= MOTION_COOLDOWN:
+        _motion["last_log"] = now
+        log_event("motion", "Motion detected around the device", source="auto",
+                  reason="person_detected", metadata={"client_id": client_id})
+    _motion["prev"] = person
 
 
 # ======================================================
@@ -172,6 +251,7 @@ def publish_commands(commands):
         print(f"[CMD] {cmd['device']} -> {cmd['command']} ({cmd['reason']})")
         socketio.emit("device_command", cmd)
     if commands:
+        log_commands(commands)  # simpan ke history + push realtime
         socketio.emit("device_state", generator.snapshot())
 
 
@@ -194,6 +274,7 @@ def publish_detection_status(result, client_id):
 def process_frame(img, client_id):
     result = pose_model.detect(img)
     commands = generator.update(result)
+    track_motion(client_id)  # sebelum publish_commands: urutan log "motion" lalu "lamp on"
     publish_commands(commands)
     try:
         publish_detection_status(result, client_id)
@@ -380,6 +461,50 @@ def camera_status():
     return jsonify({"camera_running": camera_running})
 
 
+# ---------- HISTORY ----------
+@app.route("/api/history", methods=["GET"])
+@require_token
+def history_list():
+    if supabase is None:
+        return jsonify({"success": False, "message": "Supabase belum dikonfigurasi"}), 503
+    try:
+        limit = max(1, min(int(request.args.get("limit", 100)), 300))
+        before = request.args.get("before")  # cursor: created_at item terlama yang sudah dimuat
+        q = (
+            supabase.table("device_history")
+            .select("id,event_type,device,source,message,reason,created_at")
+            .eq("device_id", DEVICE_ID)
+            .order("created_at", desc=True)
+            .order("id", desc=True)
+            .limit(limit)
+        )
+        if before:
+            q = q.lt("created_at", before)
+        rows = q.execute().data or []
+        return jsonify({"success": True, "items": rows, "has_more": len(rows) == limit})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/api/history/log", methods=["POST"])
+@require_token
+def history_log():
+    """Dipakai script lain di Raspi (jadwal, feedback relay) untuk menulis event."""
+    data = request.json or {}
+    event_type = data.get("event_type")
+    if event_type not in VALID_EVENT_TYPES:
+        return jsonify({"success": False, "message": "event_type tidak valid"}), 400
+    log_event(
+        event_type,
+        data.get("message") or event_type,
+        device=data.get("device"),
+        source=data.get("source", "system"),
+        reason=data.get("reason"),
+        metadata=data.get("metadata"),
+    )
+    return jsonify({"success": True})
+
+
 # ======================================================
 # SOCKET.IO EVENTS
 # ======================================================
@@ -452,6 +577,7 @@ def on_ping(_=None):
 # ======================================================
 def main():
     setup_mqtt()
+    socketio.start_background_task(history_worker)
     if CAMERA_AUTOSTART:
         start_camera()
     socketio.run(app, host="0.0.0.0", port=PORT, debug=False)
